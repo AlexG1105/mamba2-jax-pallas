@@ -25,12 +25,14 @@ Single Mamba2 SSD layer forward pass on H100 (batch=1, fp32, amortized GPU time)
 
 | Config | Pallas Mosaic | Triton (mamba-ssm) | Naive JAX/XLA | Pallas/Triton |
 |--------|--------------|-------------------|--------------|--------------|
-| mamba2-130m (H=24, G=1, Q=256) | 0.11 ms | 0.35 ms | 0.42 ms | 0.33x |
-| mamba2-2.7b (H=80, G=1, Q=256) | 0.26 ms | 0.34 ms | 1.23 ms | 0.77x |
-| nemotron-h (H=128, G=8, Q=128) | 0.51 ms | 0.36 ms | 2.45 ms | 1.40x |
-| nemotron-h L=4096 | 0.94 ms | 0.70 ms | 4.66 ms | 1.35x |
+| mamba2-130m (H=24, G=1, Q=256) | 0.11 ms | 0.35 ms | 0.43 ms | 0.32x |
+| mamba2-2.7b (H=80, G=1, Q=256) | 0.26 ms | 0.34 ms | 1.22 ms | 0.78x |
+| nemotron-h-4b (H=112, G=8, Q=256) | 0.37 ms | 0.34 ms | 1.72 ms | 1.10x |
+| nemotron-h-8b (H=128, G=8, Q=128) | 0.51 ms | 0.36 ms | 2.45 ms | 1.41x |
+| nemotron-h-47b (H=256, G=8, N=256, Q=128) | 1.36 ms | 0.94 ms | 2.46 ms | 1.44x |
+| nemotron-h-8b L=4096 | 0.94 ms | 0.69 ms | 4.65 ms | 1.36x |
 
-All configs use seqlen=2048 (except last), P=64 (headdim), N=128 (d_state). All timings are amortized (dispatch overhead excluded). Pallas/Triton < 1.0 means Pallas is faster.
+All configs use seqlen=2048 (except last), P=64 (headdim), N=128 (d_state) unless noted (47b uses N=256). All timings are amortized (dispatch overhead excluded). Pallas/Triton < 1.0 means Pallas is faster.
 
 Reproduce with:
 ```bash

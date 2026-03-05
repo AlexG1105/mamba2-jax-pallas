@@ -141,15 +141,27 @@ CONFIGS = [
         "ngroups": 1, "chunk_size": 256,
     },
     {
-        "name": "nemotron-h (mamba2 layer)",
+        "name": "nemotron-h-4b (mamba2 layer)",
+        "batch": 1, "seqlen": 2048,
+        "nheads": 112, "headdim": 64, "dstate": 128,
+        "ngroups": 8, "chunk_size": 256,
+    },
+    {
+        "name": "nemotron-h-8b (mamba2 layer)",
         "batch": 1, "seqlen": 2048,
         "nheads": 128, "headdim": 64, "dstate": 128,
         "ngroups": 8, "chunk_size": 128,
     },
     {
-        "name": "nemotron-h (mamba2 layer) L=4096",
+        "name": "nemotron-h-8b (mamba2 layer) L=4096",
         "batch": 1, "seqlen": 4096,
         "nheads": 128, "headdim": 64, "dstate": 128,
+        "ngroups": 8, "chunk_size": 128,
+    },
+    {
+        "name": "nemotron-h-47b (mamba2 layer)",
+        "batch": 1, "seqlen": 2048,
+        "nheads": 256, "headdim": 64, "dstate": 256,
         "ngroups": 8, "chunk_size": 128,
     },
 ]
