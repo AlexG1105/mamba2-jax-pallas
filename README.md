@@ -2,6 +2,8 @@
 
 Mamba2 Selective State Space Model in JAX, with Pallas Mosaic GPU kernels optimized for NVIDIA Hopper (H100/H200).
 
+(NOTE: Forward only, backwards not yet supported)
+
 Supports loading pretrained HuggingFace models for inference:
 - **Mamba2** (`state-spaces/mamba2-130m` through `mamba2-2.7b`)
 - **Nemotron-H** (`nvidia/Nemotron-H-8B-Base-8K`) — hybrid Mamba2 + Attention + MLP
