@@ -156,22 +156,29 @@ def _chunk_scan_fwd_kernel_body(
     states_T_gmem = states_T_ref.at[bch, :, pl.ds(pn * BN, BN)]   # (dstate_padded, BN)
 
     # Swizzle/tiling transforms for WGMMA-compatible SMEM layout
+    # WGMMA requires lhs and rhs swizzles to match, so use the minimum.
+    b_swizzle = plgpu.find_swizzle(BN * 16)
     # Matmul 1: A-side = CB (BM, BK_cs), B-side = x_scaled (BK_cs, BN)
     a1_swizzle = plgpu.find_swizzle(BK_cs * 16)
+    swizzle1 = min(a1_swizzle, b_swizzle)
     a1_transforms = (
-        plgpu.TilingTransform((8, a1_swizzle // 2)),
-        plgpu.SwizzleTransform(a1_swizzle),
+        plgpu.TilingTransform((8, swizzle1 // 2)),
+        plgpu.SwizzleTransform(swizzle1),
     )
-    b_swizzle = plgpu.find_swizzle(BN * 16)
-    b_transforms = (
-        plgpu.TilingTransform((8, b_swizzle // 2)),
-        plgpu.SwizzleTransform(b_swizzle),
+    b1_transforms = (
+        plgpu.TilingTransform((8, swizzle1 // 2)),
+        plgpu.SwizzleTransform(swizzle1),
     )
     # Matmul 2: A-side = C (BM, BK_ds), B-side = states_T (BK_ds, BN)
     a2_swizzle = plgpu.find_swizzle(BK_ds * 16)
+    swizzle2 = min(a2_swizzle, b_swizzle)
     a2_transforms = (
-        plgpu.TilingTransform((8, a2_swizzle // 2)),
-        plgpu.SwizzleTransform(a2_swizzle),
+        plgpu.TilingTransform((8, swizzle2 // 2)),
+        plgpu.SwizzleTransform(swizzle2),
+    )
+    b2_transforms = (
+        plgpu.TilingTransform((8, swizzle2 // 2)),
+        plgpu.SwizzleTransform(swizzle2),
     )
 
     def _with_acc(acc_ref):
@@ -190,7 +197,7 @@ def _chunk_scan_fwd_kernel_body(
                 ),
                 plgpu.BlockSpec(
                     (BK_cs, BN), lambda k: (k, 0),
-                    transforms=b_transforms,
+                    transforms=b1_transforms,
                 ),
             ],
             max_concurrent_steps=num_stages,
@@ -211,7 +218,7 @@ def _chunk_scan_fwd_kernel_body(
                 ),
                 plgpu.BlockSpec(
                     (BK_ds, BN), lambda k: (k, 0),
-                    transforms=b_transforms,
+                    transforms=b2_transforms,
                 ),
             ],
             max_concurrent_steps=num_stages,
@@ -319,7 +326,7 @@ def chunk_scan_preprocess(
     x_chunked = x.reshape(batch, nchunks, chunk_size, nheads, hdim)
 
     # scale_x = dt * exp(-dA_cs): (batch, nheads, nchunks, Q)
-    scale_x = dt * jnp.exp(-dA_cumsum)
+    scale_x = dt * jnp.exp(jnp.clip(-dA_cumsum, a_max=80.0))
 
     # Rearrange to (batch, nchunks, Q, nheads) for broadcasting with x_chunked
     scale_for_x = scale_x.transpose(0, 2, 3, 1)  # (batch, nchunks, Q, nheads)

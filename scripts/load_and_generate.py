@@ -124,7 +124,22 @@ def main():
     print(f"  Token IDs: {input_ids_jax.shape}")
     print()
 
-    # ---- Step 4: Generate ----
+    # ---- Step 4: Warmup (JIT compilation) ----
+    print("Compiling decode step (JIT + scan over layers)...")
+    rng = jax.random.PRNGKey(args.seed)
+    t0 = time.time()
+    warmup_ids = model.generate(
+        params, input_ids_jax,
+        max_new_tokens=1,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        rng_key=rng,
+    )
+    jax.block_until_ready(warmup_ids)
+    t_compile = time.time() - t0
+    print(f"  Compiled in {t_compile:.1f}s")
+
+    # ---- Step 5: Generate ----
     print(f"Generating {args.max_tokens} tokens (temperature={args.temperature}, top_k={args.top_k})...")
     rng = jax.random.PRNGKey(args.seed)
 

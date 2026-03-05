@@ -255,10 +255,30 @@ class Mamba2LMHeadModel:
         batch = input_ids.shape[0]
         assert batch == 1, "Generation only supports batch=1"
 
-        # Prefill
+        # Prefill (eager, runs once)
         logits, inference_state = self._forward_with_cache(
             params, input_ids, inference_state=None,
         )
+
+        # Stack layer params and states for scan-based JIT decode
+        stacked_layer_params = jax.tree.map(
+            lambda *xs: jnp.stack(xs), *params["layers"]
+        )
+        non_layer_params = {
+            "embedding": params["embedding"],
+            "norm_f_weight": params["norm_f_weight"],
+            "lm_head_weight": params["lm_head_weight"],
+        }
+        conv_states = jnp.stack([s[0] for s in inference_state])
+        ssm_states = jnp.stack([s[1] for s in inference_state])
+
+        # Build JIT-compiled decode step (cached on self to avoid recompilation)
+        if not hasattr(self, '_decode_step_jit'):
+            self._decode_step_jit = jax.jit(
+                lambda slp, nlp, tok, cs, ss: _scan_decode_step(
+                    slp, nlp, tok, cs, ss, cfg
+                )
+            )
 
         # Sample first token
         next_token_logits = logits[:, -1, :]  # (1, vocab)
@@ -273,11 +293,11 @@ class Mamba2LMHeadModel:
             )
             all_ids.append(next_token[:, None])
 
-            # Step forward
-            logits, inference_state = self._forward_with_cache(
-                params, next_token[:, None], inference_state=inference_state,
+            # JIT-compiled decode step with scan over layers
+            next_token_logits, conv_states, ssm_states = self._decode_step_jit(
+                stacked_layer_params, non_layer_params,
+                next_token[:, None], conv_states, ssm_states,
             )
-            next_token_logits = logits[:, -1, :]
 
         return jnp.concatenate(all_ids, axis=1)
 
@@ -638,3 +658,79 @@ def _sample_token(logits, rng_key, temperature=1.0, top_k=50):
         logits = jnp.where(logits < min_val, -1e10, logits)
 
     return jax.random.categorical(rng_key, logits, axis=-1)
+
+
+# ---------------------------------------------------------------------------
+# JIT-compiled decode step using jax.lax.scan over layers
+# ---------------------------------------------------------------------------
+
+def _scan_decode_step(stacked_layer_params, non_layer_params, token, conv_states, ssm_states, cfg):
+    """
+    Single-token decode using jax.lax.scan over layers.
+
+    All layer params and states have a leading (n_layer,) dimension.
+    scan compiles one layer body and loops, giving fast compilation and execution.
+    """
+    from mamba2_jax.ops.causal_conv1d import causal_conv1d_update
+    from mamba2_jax.ops.selective_state_update import selective_state_update
+
+    d_inner = cfg.d_inner
+    d_ssm = d_inner
+    ngs = cfg.ngroups * cfg.d_state
+    dtype = jnp.float32 if cfg.residual_in_fp32 else jnp.float32
+
+    x = non_layer_params["embedding"]["weight"][token]  # (1, 1, d_model)
+
+    def layer_fn(x, layer_inputs):
+        layer_params, conv_state, ssm_state = layer_inputs
+        mixer = layer_params["mixer"]
+
+        residual = x.astype(dtype)
+        x_normed = rms_norm(x.astype(jnp.float32), layer_params["norm_weight"])
+
+        hidden = x_normed[:, 0, :]  # (batch, d_model)
+
+        A = -jnp.exp(mixer["A_log"].astype(jnp.float32))
+        D = mixer["D"]
+        dt_bias = mixer["dt_bias"]
+
+        zxbcdt = hidden @ mixer["in_proj_kernel"]
+        z = zxbcdt[:, :d_ssm]
+        xBC = zxbcdt[:, d_ssm:2 * d_ssm + 2 * ngs]
+        dt = zxbcdt[:, 2 * d_ssm + 2 * ngs:]
+
+        new_conv_state, xBC_out = causal_conv1d_update(
+            xBC, conv_state, mixer["conv1d_weight"],
+            bias=mixer["conv1d_bias"], activation="silu",
+        )
+
+        x_ssm = xBC_out[:, :d_ssm].reshape(-1, cfg.nheads, cfg.headdim)
+        B = xBC_out[:, d_ssm:d_ssm + ngs].reshape(-1, cfg.ngroups, cfg.d_state)
+        C = xBC_out[:, d_ssm + ngs:].reshape(-1, cfg.ngroups, cfg.d_state)
+
+        new_ssm_state, y = selective_state_update(
+            ssm_state, x_ssm, dt, A, B, C,
+            D=D, z=None, dt_bias=dt_bias, dt_softplus=True,
+        )
+        y = y.reshape(-1, d_ssm)
+
+        if cfg.rmsnorm:
+            y = rms_norm_gated(
+                y, mixer["norm_weight"], z=z,
+                group_size=d_ssm // cfg.ngroups,
+                norm_before_gate=cfg.norm_before_gate,
+            )
+
+        out = y @ mixer["out_proj_kernel"]
+        x = residual + out[:, None, :].astype(dtype)
+        return x, (new_conv_state, new_ssm_state)
+
+    x, (new_conv_states, new_ssm_states) = jax.lax.scan(
+        layer_fn, x, (stacked_layer_params, conv_states, ssm_states),
+    )
+
+    x = rms_norm(x.astype(jnp.float32), non_layer_params["norm_f_weight"])
+    logits = x @ non_layer_params["lm_head_weight"].T
+    next_token_logits = logits[:, 0, :]  # (1, vocab)
+
+    return next_token_logits, new_conv_states, new_ssm_states

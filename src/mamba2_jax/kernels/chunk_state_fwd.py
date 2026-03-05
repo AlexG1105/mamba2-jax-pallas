@@ -142,15 +142,17 @@ def _chunk_state_kernel_body(
     B_gmem   = B_ref.at[bcg, :, pl.ds(pn * BN, BN)]        # (chunk_size, BN) bf16
 
     # Swizzle/tiling transforms for WGMMA-compatible SMEM layout
+    # WGMMA requires lhs and rhs swizzles to match, so use the minimum.
     a_swizzle = plgpu.find_swizzle(BK * 16)                 # 16 bits per bf16
-    a_transforms = (
-        plgpu.TilingTransform((8, a_swizzle // 2)),
-        plgpu.SwizzleTransform(a_swizzle),
-    )
     b_swizzle = plgpu.find_swizzle(BN * 16)
+    swizzle = min(a_swizzle, b_swizzle)
+    a_transforms = (
+        plgpu.TilingTransform((8, swizzle // 2)),
+        plgpu.SwizzleTransform(swizzle),
+    )
     b_transforms = (
-        plgpu.TilingTransform((8, b_swizzle // 2)),
-        plgpu.SwizzleTransform(b_swizzle),
+        plgpu.TilingTransform((8, swizzle // 2)),
+        plgpu.SwizzleTransform(swizzle),
     )
 
     def _with_acc(acc_ref):
