@@ -306,6 +306,227 @@ def _mlp_forward(x, mlp_params, cfg):
     return out
 
 
+def _attention_forward_with_cache(x, attn_params, cfg, max_cache_len=None):
+    """Attention forward that also returns fixed-size K,V caches for decode."""
+    batch, seqlen, _ = x.shape
+    head_dim = cfg.attention_head_dim
+    n_heads = cfg.num_attention_heads
+    n_kv_heads = cfg.num_key_value_heads
+    n_groups = n_heads // n_kv_heads
+
+    q = (x @ attn_params["q_proj_kernel"]).reshape(batch, seqlen, n_heads, head_dim)
+    k = (x @ attn_params["k_proj_kernel"]).reshape(batch, seqlen, n_kv_heads, head_dim)
+    v = (x @ attn_params["v_proj_kernel"]).reshape(batch, seqlen, n_kv_heads, head_dim)
+
+    k_exp = jnp.repeat(k, n_groups, axis=2)
+    v_exp = jnp.repeat(v, n_groups, axis=2)
+
+    q_t = jnp.transpose(q, (0, 2, 1, 3))
+    k_t = jnp.transpose(k_exp, (0, 2, 1, 3))
+    v_t = jnp.transpose(v_exp, (0, 2, 1, 3))
+
+    scale = 1.0 / math.sqrt(head_dim)
+    attn = jnp.matmul(q_t, jnp.transpose(k_t, (0, 1, 3, 2))) * scale
+    mask = jnp.tril(jnp.ones((seqlen, seqlen)))
+    attn = jnp.where(mask[None, None, :, :], attn, -1e9)
+    attn = jax.nn.softmax(attn, axis=-1)
+
+    out = jnp.matmul(attn, v_t)
+    out = jnp.transpose(out, (0, 2, 1, 3)).reshape(batch, seqlen, n_heads * head_dim)
+    out = out @ attn_params["o_proj_kernel"]
+
+    # Build fixed-size KV cache for decode
+    if max_cache_len is not None:
+        k_cache = jnp.zeros((batch, max_cache_len, n_kv_heads, head_dim), dtype=k.dtype)
+        v_cache = jnp.zeros((batch, max_cache_len, n_kv_heads, head_dim), dtype=v.dtype)
+        k_cache = k_cache.at[:, :seqlen, :, :].set(k)
+        v_cache = v_cache.at[:, :seqlen, :, :].set(v)
+    else:
+        k_cache = k
+        v_cache = v
+
+    return out, k_cache, v_cache
+
+
+def _attention_decode_step(x, attn_params, k_cache, v_cache, cache_pos, cfg):
+    """
+    Single-token attention decode with fixed-size KV cache.
+
+    x: (batch, 1, d_model)
+    k_cache: (batch, max_len, n_kv_heads, head_dim)
+    v_cache: (batch, max_len, n_kv_heads, head_dim)
+    cache_pos: scalar int — next write position in cache
+    """
+    head_dim = cfg.attention_head_dim
+    n_heads = cfg.num_attention_heads
+    n_kv_heads = cfg.num_key_value_heads
+    n_groups = n_heads // n_kv_heads
+    batch = x.shape[0]
+
+    q = (x @ attn_params["q_proj_kernel"]).reshape(batch, 1, n_heads, head_dim)
+    k_new = (x @ attn_params["k_proj_kernel"]).reshape(batch, 1, n_kv_heads, head_dim)
+    v_new = (x @ attn_params["v_proj_kernel"]).reshape(batch, 1, n_kv_heads, head_dim)
+
+    # Write new K,V at cache_pos
+    k_cache = k_cache.at[:, cache_pos, :, :].set(k_new[:, 0, :, :])
+    v_cache = v_cache.at[:, cache_pos, :, :].set(v_new[:, 0, :, :])
+
+    # Only attend to valid positions [0, cache_pos]
+    valid_len = cache_pos + 1
+
+    # GQA expand
+    k_exp = jnp.repeat(k_cache, n_groups, axis=2)
+    v_exp = jnp.repeat(v_cache, n_groups, axis=2)
+
+    # q: (batch, n_heads, 1, head_dim), k: (batch, n_heads, max_len, head_dim)
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k_exp = jnp.transpose(k_exp, (0, 2, 1, 3))
+    v_exp = jnp.transpose(v_exp, (0, 2, 1, 3))
+
+    scale = 1.0 / math.sqrt(head_dim)
+    attn = jnp.matmul(q, jnp.transpose(k_exp, (0, 1, 3, 2))) * scale
+
+    # Mask out positions beyond valid_len
+    pos_mask = jnp.arange(k_cache.shape[1]) < valid_len
+    attn = jnp.where(pos_mask[None, None, None, :], attn, -1e9)
+    attn = jax.nn.softmax(attn, axis=-1)
+
+    out = jnp.matmul(attn, v_exp)
+    out = jnp.transpose(out, (0, 2, 1, 3)).reshape(batch, 1, n_heads * head_dim)
+    out = out @ attn_params["o_proj_kernel"]
+    return out, k_cache, v_cache
+
+
+def _mamba2_decode_step(x, mixer_params, conv_state, ssm_state, cfg):
+    """
+    Single-token Mamba2 decode step.
+
+    x: (batch, d_model) — single token hidden state (already normed)
+    """
+    from mamba2_jax.ops.causal_conv1d import causal_conv1d_update
+    from mamba2_jax.ops.selective_state_update import selective_state_update
+
+    d_inner = cfg.d_inner
+    d_ssm = d_inner
+    ngs = cfg.ngroups * cfg.d_state
+
+    A = -jnp.exp(mixer_params["A_log"].astype(jnp.float32))
+    D = mixer_params["D"]
+    dt_bias = mixer_params["dt_bias"]
+
+    zxbcdt = x @ mixer_params["in_proj_kernel"]
+    z = zxbcdt[:, :d_ssm]
+    xBC = zxbcdt[:, d_ssm:2 * d_ssm + 2 * ngs]
+    dt = zxbcdt[:, 2 * d_ssm + 2 * ngs:]
+
+    new_conv_state, xBC_out = causal_conv1d_update(
+        xBC, conv_state, mixer_params["conv1d_weight"],
+        bias=mixer_params["conv1d_bias"], activation="silu",
+    )
+
+    x_ssm = xBC_out[:, :d_ssm].reshape(-1, cfg.nheads, cfg.headdim)
+    B = xBC_out[:, d_ssm:d_ssm + ngs].reshape(-1, cfg.ngroups, cfg.d_state)
+    C = xBC_out[:, d_ssm + ngs:].reshape(-1, cfg.ngroups, cfg.d_state)
+
+    new_ssm_state, y = selective_state_update(
+        ssm_state, x_ssm, dt, A, B, C,
+        D=D, z=None, dt_bias=dt_bias, dt_softplus=True,
+    )
+    y = y.reshape(-1, d_ssm)
+
+    y = rms_norm_gated(
+        y, mixer_params["norm_weight"], z=z,
+        group_size=d_ssm // cfg.ngroups,
+        norm_before_gate=False,
+        eps=cfg.rms_norm_eps,
+    )
+
+    out = y @ mixer_params["out_proj_kernel"]
+    return out, new_conv_state, new_ssm_state
+
+
+def _decode_step(params, token, cache, cfg):
+    """
+    Single-token decode for Nemotron-H.
+
+    Python loop over layers is unrolled by JAX at trace time.
+    Each layer type uses its own decode logic:
+    - mamba2: conv_state + ssm_state update
+    - attention: fixed-size KV cache with position index
+    - mlp: stateless forward
+    """
+    layer_types = cfg.layer_types
+
+    x = params["embedding"]["weight"][token]  # (1, 1, d_model)
+    dtype = x.dtype
+    cache_pos = cache["cache_pos"]
+
+    mamba2_idx = 0
+    attn_idx = 0
+    new_mamba2_cache = []
+    new_attn_cache = []
+
+    for i in range(cfg.num_hidden_layers):
+        layer_params = params["layers"][i]
+        mixer = layer_params["mixer"]
+
+        residual = x.astype(dtype)
+        x_normed = rms_norm(
+            x.astype(jnp.float32), layer_params["norm_weight"],
+            eps=cfg.rms_norm_eps,
+        ).astype(dtype)
+
+        ltype = layer_types[i]
+
+        if ltype == "mamba2":
+            conv_state, ssm_state = cache["mamba2"][mamba2_idx]
+            x_out, new_conv, new_ssm = _mamba2_decode_step(
+                x_normed[:, 0, :], mixer, conv_state, ssm_state, cfg
+            )
+            new_mamba2_cache.append((new_conv, new_ssm))
+            x_out = x_out[:, None, :]
+            mamba2_idx += 1
+
+        elif ltype == "attention":
+            k_cache, v_cache = cache["attention"][attn_idx]
+            x_out, new_k, new_v = _attention_decode_step(
+                x_normed, mixer, k_cache, v_cache, cache_pos, cfg
+            )
+            new_attn_cache.append((new_k, new_v))
+            attn_idx += 1
+
+        elif ltype == "mlp":
+            x_out = _mlp_forward(x_normed, mixer, cfg)
+
+        x = residual + x_out.astype(dtype)
+
+    x = rms_norm(
+        x.astype(jnp.float32), params["norm_f_weight"],
+        eps=cfg.rms_norm_eps,
+    ).astype(dtype)
+    logits = x @ params["lm_head_weight"]
+    next_token_logits = logits[:, 0, :]
+
+    new_cache = {
+        "mamba2": new_mamba2_cache,
+        "attention": new_attn_cache,
+        "cache_pos": cache_pos + 1,
+    }
+    return next_token_logits, new_cache
+
+
+def _sample_token(logits, rng_key, temperature=1.0, top_k=50):
+    """Sample a token from logits with temperature and top-k."""
+    if temperature == 0:
+        return jnp.argmax(logits, axis=-1)
+    logits = logits / temperature
+    if top_k > 0:
+        top_k_vals = jax.lax.top_k(logits, top_k)
+        min_val = top_k_vals[0][:, -1:]
+        logits = jnp.where(logits < min_val, -1e10, logits)
+    return jax.random.categorical(rng_key, logits, axis=-1)
+
+
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
@@ -380,6 +601,193 @@ class NemotronHModel:
         # lm_head_weight is stored pre-transposed: (d_model, vocab)
         logits = x @ params["lm_head_weight"]
         return logits
+
+    def generate(
+        self,
+        params,
+        input_ids,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        rng_key=None,
+    ):
+        """
+        Autoregressive text generation with cached decode.
+
+        Parameters
+        ----------
+        params : dict
+        input_ids : (1, prompt_len) int — batch=1 only.
+        max_new_tokens : int
+        temperature : float
+        top_k : int
+        rng_key : jax.random.PRNGKey
+
+        Returns
+        -------
+        output_ids : (1, prompt_len + max_new_tokens)
+        """
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(0)
+
+        cfg = self.config
+        assert input_ids.shape[0] == 1, "Generation only supports batch=1"
+
+        prompt_len = input_ids.shape[1]
+        max_cache_len = prompt_len + max_new_tokens
+
+        # Prefill: full forward pass, collect states
+        logits, cache = self._forward_with_cache(
+            params, input_ids, max_cache_len=max_cache_len
+        )
+
+        # Build JIT-compiled decode step (cached to avoid recompilation)
+        if not hasattr(self, '_decode_step_jit'):
+            self._decode_step_jit = jax.jit(
+                lambda p, tok, c: _decode_step(p, tok, c, cfg)
+            )
+
+        # Strip non-array "type" strings from params for JIT compatibility
+        jit_params = {
+            "embedding": params["embedding"],
+            "layers": [
+                {"norm_weight": lp["norm_weight"], "mixer": lp["mixer"]}
+                for lp in params["layers"]
+            ],
+            "norm_f_weight": params["norm_f_weight"],
+            "lm_head_weight": params["lm_head_weight"],
+        }
+
+        # Sample first token from prefill logits
+        next_token_logits = logits[:, -1, :]
+        all_ids = [input_ids]
+
+        for step in range(max_new_tokens):
+            rng_key, sample_key = jax.random.split(rng_key)
+            next_token = _sample_token(
+                next_token_logits, sample_key, temperature, top_k
+            )
+            all_ids.append(next_token[:, None])
+
+            next_token_logits, cache = self._decode_step_jit(
+                jit_params, next_token[:, None], cache,
+            )
+
+        return jnp.concatenate(all_ids, axis=1)
+
+    def _forward_with_cache(self, params, input_ids, max_cache_len=None):
+        """
+        Forward pass that returns per-layer cache for cached decode.
+
+        Returns (logits, cache) where cache is a dict with:
+        - 'mamba2': list of (conv_state, ssm_state) for mamba2 layers
+        - 'attention': list of (k_cache, v_cache) for attention layers
+        - 'cache_pos': int — next write position for attention KV cache
+        """
+        from mamba2_jax.ops.causal_conv1d import causal_conv1d
+        from mamba2_jax.modules.mamba2 import _ssd_combined_fwd
+
+        cfg = self.config
+        batch, seqlen = input_ids.shape
+        d_inner = cfg.d_inner
+        d_ssm = d_inner
+        ngs = cfg.ngroups * cfg.d_state
+
+        x = params["embedding"]["weight"][input_ids]
+        dtype = jnp.float32 if cfg.residual_in_fp32 else x.dtype
+
+        cache = {"mamba2": [], "attention": [], "cache_pos": jnp.array(seqlen, dtype=jnp.int32)}
+
+        for i, layer_params in enumerate(params["layers"]):
+            residual = x.astype(dtype)
+            x_normed = rms_norm(
+                x.astype(jnp.float32), layer_params["norm_weight"],
+                eps=cfg.rms_norm_eps,
+            ).astype(dtype)
+
+            layer_type = layer_params["type"]
+            mixer = layer_params["mixer"]
+
+            if layer_type == "mamba2":
+                A = -jnp.exp(mixer["A_log"].astype(jnp.float32))
+                D = mixer["D"]
+                dt_bias = mixer["dt_bias"]
+
+                zxbcdt = x_normed @ mixer["in_proj_kernel"]
+                z = zxbcdt[:, :, :d_ssm]
+                xBC = zxbcdt[:, :, d_ssm:2 * d_ssm + 2 * ngs]
+                dt = zxbcdt[:, :, 2 * d_ssm + 2 * ngs:]
+
+                # Save conv state: last d_conv timesteps of xBC (pre-conv)
+                conv_dim = xBC.shape[2]
+                if seqlen >= cfg.d_conv:
+                    conv_state = jnp.transpose(
+                        xBC[:, -(cfg.d_conv):, :], (0, 2, 1)
+                    )  # (batch, conv_dim, d_conv)
+                else:
+                    conv_state = jnp.zeros(
+                        (batch, conv_dim, cfg.d_conv), dtype=dtype
+                    )
+                    conv_state = conv_state.at[:, :, -(seqlen):].set(
+                        jnp.transpose(xBC, (0, 2, 1))
+                    )
+
+                xBC_conv = causal_conv1d(
+                    jnp.transpose(xBC, (0, 2, 1)),
+                    mixer["conv1d_weight"],
+                    bias=mixer.get("conv1d_bias"),
+                    activation="silu",
+                )
+                xBC = jnp.transpose(xBC_conv, (0, 2, 1))
+
+                x_ssm = xBC[:, :, :d_ssm].reshape(batch, seqlen, cfg.nheads, cfg.headdim)
+                B = xBC[:, :, d_ssm:d_ssm + ngs].reshape(batch, seqlen, cfg.ngroups, cfg.d_state)
+                C = xBC[:, :, d_ssm + ngs:].reshape(batch, seqlen, cfg.ngroups, cfg.d_state)
+
+                scan_result = _ssd_combined_fwd(
+                    x=x_ssm, dt=dt, A=A, B=B, C=C,
+                    chunk_size=cfg.chunk_size,
+                    D=D, z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    dt_limit=cfg.time_step_limit,
+                    return_final_states=True,
+                )
+                if isinstance(scan_result, tuple):
+                    y, final_states = scan_result
+                else:
+                    y = scan_result
+                    final_states = jnp.zeros(
+                        (batch, cfg.nheads, cfg.headdim, cfg.d_state), dtype=dtype
+                    )
+                y = y.reshape(batch, seqlen, d_ssm)
+
+                y = rms_norm_gated(
+                    y, mixer["norm_weight"], z=z,
+                    group_size=d_ssm // cfg.ngroups,
+                    norm_before_gate=False,
+                    eps=cfg.rms_norm_eps,
+                )
+                x_out = y @ mixer["out_proj_kernel"]
+                cache["mamba2"].append((conv_state, final_states))
+
+            elif layer_type == "attention":
+                x_out, k_cache, v_cache = _attention_forward_with_cache(
+                    x_normed, mixer, cfg, max_cache_len=max_cache_len,
+                )
+                cache["attention"].append((k_cache, v_cache))
+
+            elif layer_type == "mlp":
+                x_out = _mlp_forward(x_normed, mixer, cfg)
+
+            x = residual + x_out.astype(dtype)
+
+        x = rms_norm(
+            x.astype(jnp.float32), params["norm_f_weight"],
+            eps=cfg.rms_norm_eps,
+        ).astype(dtype)
+        logits = x @ params["lm_head_weight"]
+        return logits, cache
 
 
 # ---------------------------------------------------------------------------

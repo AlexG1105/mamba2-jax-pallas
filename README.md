@@ -48,12 +48,16 @@ python scripts/load_and_generate.py --model mamba2-2.7b --dtype bfloat16
 
 Available sizes: `mamba2-130m`, `mamba2-370m`, `mamba2-780m`, `mamba2-1.3b`, `mamba2-2.7b`
 
-### Load and validate Nemotron-H
+### Load and generate with Nemotron-H
 
 ```bash
+python scripts/load_nemotron.py --model nemotron-h-4b --dtype bfloat16 --prompt "The meaning of life is"
+python scripts/load_nemotron.py --model nemotron-h-8b --dtype bfloat16 --prompt "The meaning of life is"
+python scripts/load_nemotron.py --model nemotron-h-8b-reasoning --dtype bfloat16
 python scripts/load_nemotron.py --validate-only --dtype bfloat16
-python scripts/load_nemotron.py --dtype bfloat16 --prompt "The meaning of life is"
 ```
+
+Available variants: `nemotron-h-4b`, `nemotron-h-8b`, `nemotron-h-8b-reasoning` (or pass any HuggingFace model ID directly)
 
 ### Use as a library
 

@@ -17,6 +17,10 @@ Usage:
     # Custom prompt
     python scripts/load_nemotron.py --dtype bfloat16 --prompt "The meaning of life is"
 
+    # Select model variant
+    python scripts/load_nemotron.py --model nemotron-h-8b
+    python scripts/load_nemotron.py --model nemotron-h-8b-reasoning
+
 Prerequisites:
     pip install huggingface-hub torch safetensors transformers
 """
@@ -33,11 +37,18 @@ import jax.numpy as jnp
 import numpy as np
 
 
+MODEL_VARIANTS = {
+    "nemotron-h-4b": "nvidia/Nemotron-H-4B-Base-8K",
+    "nemotron-h-8b": "nvidia/Nemotron-H-8B-Base-8K",
+    "nemotron-h-8b-reasoning": "nvidia/Nemotron-H-8B-Reasoning-128K",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Load Nemotron-H and validate/generate")
     parser.add_argument(
-        "--model", type=str, default="nvidia/Nemotron-H-8B-Base-8K",
-        help="HuggingFace model ID",
+        "--model", type=str, default="nemotron-h-8b",
+        help="Model variant (nemotron-h-4b, nemotron-h-8b, nemotron-h-8b-reasoning) or full HuggingFace ID",
     )
     parser.add_argument("--prompt", type=str, default="The meaning of life is", help="Input prompt")
     parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens to generate")
@@ -50,8 +61,11 @@ def main():
     dtype_map = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
     dtype = dtype_map[args.dtype]
 
+    # Resolve model name
+    model_id = MODEL_VARIANTS.get(args.model, args.model)
+
     print(f"Device: {jax.devices()[0]}")
-    print(f"Model:  {args.model}")
+    print(f"Model:  {model_id}")
     print(f"dtype:  {args.dtype}")
     print()
 
@@ -61,7 +75,7 @@ def main():
 
     from mamba2_jax.models.nemotron_h import load_from_pretrained
 
-    model, params, config = load_from_pretrained(args.model, dtype=dtype)
+    model, params, config = load_from_pretrained(model_id, dtype=dtype)
 
     t_load = time.time() - t0
     print(f"  Loaded in {t_load:.1f}s")
@@ -110,9 +124,8 @@ def main():
     print("Loading tokenizer...")
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     except Exception:
-        # Fallback to GPT-NeoX tokenizer
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
@@ -122,34 +135,39 @@ def main():
     print(f"  Token IDs: {input_ids_jax.shape}")
     print()
 
-    # ---- Step 4: Generate (simple greedy loop) ----
-    print(f"Generating {args.max_tokens} tokens (temperature={args.temperature})...")
+    # ---- Step 4: Generate with cached decode ----
     rng = jax.random.PRNGKey(args.seed)
 
+    # Warmup / JIT compilation (same max_new_tokens to avoid recompilation)
+    print("Compiling decode step (this takes a while for 52 layers)...")
     t0 = time.time()
-    all_ids = input_ids_jax
+    _ = model.generate(
+        params, input_ids_jax,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature if args.temperature > 0 else 1.0,
+        top_k=50 if args.temperature > 0 else 0,
+        rng_key=rng,
+    )
+    jax.block_until_ready(_)
+    t_compile = time.time() - t0
+    print(f"  Compiled in {t_compile:.1f}s")
+    print()
 
-    for step in range(args.max_tokens):
-        logits = model(params, all_ids)
-        jax.block_until_ready(logits)
-        next_logits = logits[:, -1, :]
-
-        if args.temperature == 0:
-            next_token = jnp.argmax(next_logits, axis=-1)
-        else:
-            rng, sample_key = jax.random.split(rng)
-            next_token = jax.random.categorical(
-                sample_key, next_logits / args.temperature, axis=-1
-            )
-
-        all_ids = jnp.concatenate([all_ids, next_token[:, None]], axis=1)
-
-        if step % 10 == 0:
-            print(f"  Step {step}/{args.max_tokens}...")
-
+    # Timed generation
+    print(f"Generating {args.max_tokens} tokens (temperature={args.temperature})...")
+    t0 = time.time()
+    output_ids = model.generate(
+        params, input_ids_jax,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature if args.temperature > 0 else 1.0,
+        top_k=50 if args.temperature > 0 else 0,
+        rng_key=rng,
+    )
+    jax.block_until_ready(output_ids)
     t_gen = time.time() - t0
-    output_text = tokenizer.decode(np.array(all_ids[0]), skip_special_tokens=True)
-    new_tokens = all_ids.shape[1] - input_ids_jax.shape[1]
+
+    output_text = tokenizer.decode(np.array(output_ids[0]), skip_special_tokens=True)
+    new_tokens = output_ids.shape[1] - input_ids_jax.shape[1]
 
     print(f"\n{'=' * 60}")
     print(f"Generated text ({new_tokens} tokens in {t_gen:.2f}s = {new_tokens/t_gen:.1f} tok/s):")
