@@ -15,18 +15,86 @@ Supports loading pretrained HuggingFace models for inference:
 - **Inference modes**: Prefill (chunked scan) and autoregressive decode (single-step SSM update)
 - **Text generation**: Greedy and top-k sampling with temperature
 
-## Installation
+## Environment Setup
+
+### Prerequisites
+
+- Python 3.10+
+- NVIDIA GPU with CUDA support (Hopper for Pallas kernels, any CUDA GPU for XLA fallback)
+- Conda (recommended) or pip
+
+### Option A: Conda environment (recommended)
 
 ```bash
+# Create environment
+conda create -n mamba2-jax python=3.12 -y
+conda activate mamba2-jax
+
+# Install JAX with CUDA 13 support (for Hopper / Pallas Mosaic)
+pip install jax[cuda13]>=0.9.0
+
+# Install PyTorch with CUDA 12.9 (for weight loading)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
+
+# Install remaining dependencies
+pip install -r requirements.txt
+
+# Install this package in development mode
 pip install -e .
 ```
 
-For loading HuggingFace models:
+### Option B: pip only
+
 ```bash
-pip install huggingface-hub torch transformers safetensors
+pip install jax[cuda13]>=0.9.0
+pip install torch --index-url https://download.pytorch.org/whl/cu129
+pip install -r requirements.txt
+pip install -e .
 ```
 
-Requires JAX >= 0.4.30 with GPU support. For Hopper kernels, use a JAX build with Mosaic GPU / Pallas Triton support.
+### Optional: mamba-ssm (for cross-framework comparison tests)
+
+```bash
+# Requires matching CUDA toolkit + PyTorch
+pip install mamba-ssm causal-conv1d
+```
+
+### Verified environment
+
+This project has been tested with the following versions:
+
+| Package | Version |
+|---------|---------|
+| Python | 3.12 |
+| JAX | 0.9.0 |
+| jaxlib | 0.9.0 |
+| Flax | 0.12.4 |
+| PyTorch | 2.8.0+cu129 |
+| CUDA (JAX) | 13.1 |
+| CUDA (PyTorch) | 12.9 |
+| NumPy | 2.3 |
+| transformers | 5.3 |
+| safetensors | 0.7 |
+| einops | 0.8 |
+| triton | 3.4 |
+
+Tested on:
+- **RTX 4090** (sm_89, Ada Lovelace) — XLA fallback path
+- **H100** (sm_90, Hopper) — Pallas Mosaic kernels
+
+### Dependencies overview
+
+**Core (always required):**
+- `jax[cuda13]`, `jaxlib`, `flax`, `numpy`, `scipy`, `ml-dtypes`, `einops`, `optax`, `chex`, `absl-py`
+
+**Weight loading (required for pretrained models):**
+- `torch` — PyTorch checkpoint deserialization
+- `huggingface-hub` — Model download from HuggingFace Hub
+- `safetensors` — Efficient tensor serialization (Nemotron-H uses this format)
+- `transformers` — Tokenizer for text generation
+
+**Optional:**
+- `mamba-ssm`, `causal-conv1d` — For cross-framework comparison tests against the PyTorch reference
 
 ## Quick Start
 
@@ -44,6 +112,9 @@ python scripts/load_and_generate.py --model mamba2-130m --prompt "The meaning of
 
 # Validate loading only (no generation)
 python scripts/load_and_generate.py --model mamba2-130m --validate-only
+
+# Use bfloat16 for larger models
+python scripts/load_and_generate.py --model mamba2-2.7b --dtype bfloat16
 ```
 
 Available Mamba2 sizes: `mamba2-130m`, `mamba2-370m`, `mamba2-780m`, `mamba2-1.3b`, `mamba2-2.7b`
@@ -51,18 +122,19 @@ Available Mamba2 sizes: `mamba2-130m`, `mamba2-370m`, `mamba2-780m`, `mamba2-1.3
 ### Load and validate Nemotron-H
 
 ```bash
-# Load Nemotron-H-8B (requires ~16GB VRAM in bf16, recommended for H100)
+# Load Nemotron-H-8B (~16GB download, requires ~16GB VRAM in bf16)
+# Recommended for H100; tight fit on RTX 4090
 python scripts/load_nemotron.py --validate-only --dtype bfloat16
 
-# Generate text
+# Generate text (H100 recommended)
 python scripts/load_nemotron.py --dtype bfloat16 --prompt "The meaning of life is"
 ```
 
 ### Use as a library
 
 ```python
+import jax
 import jax.numpy as jnp
-from mamba2_jax.models import Mamba2LMHeadModel, Mamba2Config
 from mamba2_jax.models.mamba2_lm import load_from_pretrained
 
 # Load pretrained model
@@ -99,7 +171,7 @@ src/mamba2_jax/
     mamba2.py             # Mamba2 Flax module (matches mamba_ssm.modules.mamba2)
 
   models/
-    mamba2_lm.py          # Full Mamba2 LM: embedding → [norm → mamba2] × N → norm → lm_head
+    mamba2_lm.py          # Full Mamba2 LM: embedding -> [norm -> mamba2] x N -> norm -> lm_head
     nemotron_h.py         # Nemotron-H hybrid: Mamba2 + Attention + MLP
 
   distributed/
@@ -155,7 +227,7 @@ On Hopper GPUs (H100/H200), the Pallas Mosaic kernels are automatically used for
 ## Running Tests
 
 ```bash
-# Ops unit tests (no GPU required, pure JAX)
+# Ops unit tests (any GPU, pure JAX)
 python tests/test_mamba2_ops.py
 
 # Self-consistency tests (prefill vs step-by-step decode)

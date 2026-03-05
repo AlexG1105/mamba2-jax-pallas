@@ -1,0 +1,29 @@
+# Core JAX (CUDA 13 / sm_90+ for Hopper, also works on sm_89/Ada)
+jax[cuda13]>=0.9.0
+jaxlib>=0.9.0
+flax>=0.12.0
+optax>=0.2.0
+chex>=0.1.80
+
+# Numerical
+numpy>=2.0
+scipy>=1.12
+ml-dtypes>=0.5.0
+einops>=0.8.0
+
+# PyTorch (for weight loading from HuggingFace checkpoints)
+# Install from https://pytorch.org with your CUDA version
+# Example: pip install torch --index-url https://download.pytorch.org/whl/cu129
+torch>=2.4.0
+
+# HuggingFace ecosystem
+huggingface-hub>=1.0
+safetensors>=0.4.0
+transformers>=4.40
+
+# Optional: mamba-ssm for cross-framework comparison tests
+# Requires matching CUDA toolkit + PyTorch
+# pip install mamba-ssm causal-conv1d
+
+# Utilities
+absl-py>=2.0
